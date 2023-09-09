@@ -1,0 +1,264 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r prepare_environment}
+library(tidyverse)
+library(taxize)
+library(httr)
+library(readr)
+setwd("/Users/anttonalberdi/github/hologenomic_data_search")
+```
+
+## Create taxonomy table
+Fetches the taxid's associated with all project, and creates a full-taxonomy table for each taxid.
+
+```{r get_taxonomy}
+#Function to convert classification into a data frame
+convert_classification <- function(classification) {
+      data.frame(taxonomic_level = classification$rank,
+                 name = classification$name,
+                 id = classification$id,
+                 stringsAsFactors = FALSE)}
+
+#### Load metagenome projects
+metagenome_studies <- read.table("search/metagenome_studies.tsv", sep="\t", header=T) %>%
+  mutate(parent_study_accession = strsplit(parent_study_accession, ";")) %>% #flatten duplicated parent studies
+  unnest(parent_study_accession)
+
+#### Create taxonomy table
+#Get all tax_id's to retrieve full taxonomy(takes a while)
+taxonomy1 <- read.table("search/genome_studies.tsv", sep="\t", header=T) %>%
+    rbind(.,read.table("search/metagenome_studies.tsv", sep="\t", header=T)) %>%
+    select(tax_id) %>%
+    unique() %>%
+    na.omit() %>%
+    pull()
+
+#Create batches of 1000
+batch_size=1000
+batches <- list()
+# Loop through the vector and create batches
+batch_ids <- rep(1:(ceiling(length(taxonomy1) / batch_size)), each = batch_size, length.out = length(taxonomy1))
+# Split the vector into batches
+batches <- split(taxonomy1, batch_ids)
+
+#Classification function (with multiple tries)
+classify_with_retry <- function(taxa) {
+  max_retries <- 5
+  retries <- 0
+  while (retries < max_retries) {
+    result <- tryCatch({
+      classification(taxa, db = "ncbi")
+    }, error = function(e) {
+      print(paste("Error:", e$message))
+      Sys.sleep(5)  # Wait for 5 seconds before retrying
+      NULL  # Return NULL to indicate failure
+    })
+    if (!is.null(result)) {
+      return(result)  # Successful classification, return the result
+    }
+    retries <- retries + 1
+  }
+  return(NULL)  # If all retries fail, return NULL
+}
+
+#Run classification in batches
+taxonomy2 <- list()
+iter=1
+for(batch in batches){
+ print(iter)
+ classification <- classify_with_retry(batch)
+ taxonomy2 <- c(taxonomy2,classification)
+ iter <- iter+1
+ Sys.sleep(5)
+}
+
+#Convert classification into a list of data frames
+taxonomy3 <- map(taxonomy2[!is.na(names(taxonomy2))], convert_classification)
+
+#Get taxonomy table
+taxonomy4 <- tibble(names = names(taxonomy3), taxonomy3) %>%
+      rename(taxonomy=2) %>%
+      unnest(cols = taxonomy) %>%
+      filter(taxonomic_level %in% c("superkingdom","phylum","class","order","family","species")) %>%
+      select(-id) %>%
+      pivot_wider(names_from = taxonomic_level, values_from = name) %>%
+      rename(tax_id = names)
+
+write.table(taxonomy4,"output/taxonomy.tsv",sep="\t",col.names=T, row.names=F, quote=FALSE)
+```
+
+## Identify connected studies
+Searches linked metagenome and genome studies through identifying study_accession and parent_study_accession accessions.
+
+```{r process_projects}
+
+taxonomy <- read.table("output/taxonomy.tsv",sep="\t", header=T) %>%
+  mutate(tax_id=as.character(tax_id))
+
+#### Load projects
+metagenome_studies <- read.table("search/metagenome_studies.tsv", sep="\t", header=T) %>%
+  mutate(parent_study_accession = strsplit(parent_study_accession, ";")) %>% #flatten duplicated parent studies
+  unnest(parent_study_accession)
+
+genome_studies <- read.table("search/genome_studies.tsv", sep="\t", header=T) %>%
+  mutate(parent_study_accession = strsplit(parent_study_accession, ";")) %>% #flatten duplicated parent studies
+  unnest(parent_study_accession) %>%
+  mutate(tax_id=as.character(tax_id)) %>%
+  left_join(taxonomy, by=join_by(tax_id==tax_id)) %>% #merge taxonomy
+  filter(class %in% c("Amphibia","Reptilia","Aves","Mammalia")) #filter only genomes of vertebrates
+
+#Same study accessions
+MGS_MGS <- inner_join(metagenome_studies,metagenome_studies,by=join_by(study_accession==study_accession), relationship = "many-to-many") %>%
+  select(-tax_id.y, -parent_study_accession.y) %>%
+  rename(parent_study_accession=2, tax_id=3) %>%
+  unique()
+
+#Same parent study accessions
+MGP_HGP <- inner_join(metagenome_studies,metagenome_studies,by=join_by(parent_study_accession==parent_study_accession), relationship = "many-to-many") %>%
+  select(-tax_id.y) %>%
+  rename(study_accession_genome=1, tax_id=3, study_accession_metagenome=4) %>%
+  select(parent_study_accession,study_accession_genome,study_accession_metagenome,tax_id)
+
+#Merge all projects and dereplicate
+paired_studies <- c(MGS_MGS$study_accession,MGP_HGP$study_accession_genome,MGP_HGP$study_accession_metagenome) %>%
+    sort() %>%
+    unique()
+
+length(paired_studies)
+
+paired_studies %>%
+    write.table(.,"output/paired_studies.txt",quote=FALSE,row.names=F,col.names=F)  
+```
+
+## Search for experiments within selected studies
+```{r search_experiments}
+ncol = 50
+
+paired_studies <- read.table("output/paired_studies.txt", header=F) %>%
+  pull()
+
+search_queries <- paired_studies %>%
+ c(., rep(NA, (ncol - (length(paired_studies) %% ncol)))) %>%
+ matrix(., ncol = ncol, byrow=TRUE) %>%
+ as_tibble() %>%
+ unite(string,everything(), sep = "%20OR%20study_accession=", na.rm	= TRUE) %>%
+ mutate(api="https://www.ebi.ac.uk/ena/portal/api/search?result=read_experiment&query=study_accession=",fields="&fields=study_accession,library_strategy,library_source") %>%
+ select(api,string,fields) %>%
+ unite(query, everything(), sep = "") %>%
+ pull()
+
+experiment_table <- c()
+iter=1
+for (query in search_queries){
+  print(iter)
+  experiment <- read.table(text = content(GET(query), "text", encoding = "UTF-8"), header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  experiment_table <- rbind(experiment_table,experiment)
+  iter=iter+1
+}
+
+write.table(experiment_table,"output/paired_experiments.txt",sep="\t",quote=FALSE,row.names=F,col.names=T)  
+```
+
+## Search for experiments within selected studies
+
+The attribute library_source can be:
+- TRANSCRIPTOMIC
+- GENOMIC
+- METAGENOMIC
+- SYNTHETIC
+- OTHER
+- METATRANSCRIPTOMIC
+- TRANSCRIPTOMIC SINGLE CELL
+- GENOMIC SINGLE CELL
+
+```{r explore_projects}
+experiment_table <- read.table("output/paired_experiments.txt",sep="\t",header=TRUE)
+experiment_table_reduced <- experiment_table %>%
+  select(-c(experiment_accession,library_strategy)) %>%
+  unique()
+
+MGP_HGP_data <- MGP_HGP %>%
+    left_join(experiment_table_reduced, by = join_by(study_accession_genome==study_accession)) %>%
+    left_join(experiment_table_reduced, by = join_by(study_accession_metagenome==study_accession)) %>%
+    select(parent_study_accession,tax_id,library_source.x,library_source.y) %>%
+    unique() %>%
+    mutate(library_source = pmap(list(library_source.x,library_source.y), c)) %>%
+    select(parent_study_accession,tax_id,library_source) %>%
+    group_by(parent_study_accession,tax_id) %>%
+    summarise(dataset = list(unique(na.omit(unlist(library_source))))) %>%
+    ungroup() %>%
+    unique() %>%
+    filter(map_lgl(dataset, ~all(c("GENOMIC", "METAGENOMIC") %in% .x))) #filter only those with GENOMIC and METAGENOMIC
+
+MGS_MGS_data <- MGS_MGS %>%
+    left_join(experiment_table_reduced,by=join_by(study_accession==study_accession)) %>%
+    group_by(study_accession,parent_study_accession,tax_id) %>%
+    summarise(dataset = list(as.character(library_source))) %>%
+    ungroup() %>%
+    unique() %>%
+    filter(map_lgl(dataset, ~all(c("GENOMIC", "METAGENOMIC") %in% .x))) %>% #filter only those with GENOMIC and METAGENOMIC
+    filter(parent_study_accession %in% MGP_HGP_data$parent_study_accession) #filter only those not present in the parent table
+
+all_studies <- MGS_MGS_data %>%
+  select(parent_study_accession,tax_id,dataset) %>%
+  bind_rows(., MGP_HGP_data) %>%
+  mutate(dataset = map(dataset, ~sort(.x))) %>%
+  unique() %>%
+  mutate(tax_id=as.character(tax_id)) %>%
+  left_join(taxonomy, by=join_by(tax_id==tax_id)) %>%
+  mutate(dataset = map_chr(dataset, ~paste(.x, collapse = ", ")))
+
+write.table(all_studies,"output/filtered_studies.tsv",sep="\t",quote=FALSE,row.names=F,col.names=T)  
+```
+
+## Manual curation of selected studies
+Select bioprojects within selected studies, and experiments within bioprojects
+
+```{r final_details}
+
+#List of manually curated parent bioprojects
+bioprojects <- c("PRJNA10709","PRJNA10718","PRJNA10726","PRJNA10804","PRJNA43379","PRJNA49537","PRJNA73299","PRJEB43192","PRJEB40770","PRJEB40771","PRJNA358636","PRJNA46305","PRJNA46941","PRJNA48489","PRJNA51441","PRJNA661099","PRJNA74933","PRJNA74937","PRJNA74951","PRJNA74955","PRJNA9558","PRJNA10637","PRJNA45885","PRJNA78065","PRJNA9555","PRJNA10621","PRJNA17401","PRJNA608517","PRJNA9557","PRJNA9559","PRJNA98095")
+
+study_statistics <- c()
+for(bioproject in bioprojects){
+  query=paste0("https://www.ebi.ac.uk/ena/portal/api/search?result=study&query=parent_study_accession=",bioproject,"&fields=study_accession")
+  project_list <- read.table(text = content(GET(query), "text", encoding = "UTF-8"), header = TRUE, sep = "\t", stringsAsFactors = FALSE) %>%
+    pull()
+
+  query_size=100
+  queries <- list()
+  # Loop through the vector and create batches
+  query_ids <- rep(1:(ceiling(length(project_list) / query_size)), each = query_size, length.out = length(project_list))
+  # Split the vector into batches
+  query_batches <- split(project_list, query_ids)
+
+  experiment_list_all <- c()
+  for(query_batch in query_batches){
+    query2=
+    paste0("https://www.ebi.ac.uk/ena/portal/api/search?result=read_experiment&query=study_accession=", paste(query_batch, collapse = '%20OR%20study_accession='),"&fields=study_accession,library_strategy,library_source")
+    experiment_list <- read.table(text = content(GET(query2), "text", encoding = "UTF-8"), header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+    experiment_list_all <- rbind(experiment_list_all,experiment_list)
+  }
+
+  experiment_list_all <- experiment_list_all %>%
+    filter(grepl("GENOMIC|METAGENOMIC", library_source)) %>%
+    select(library_strategy,library_source)
+
+  samples <- experiment_list_all %>% nrow()
+  genomic_samples <- experiment_list_all %>% filter(library_source == "GENOMIC") %>% nrow()
+  genomic_samples_amplicon <- experiment_list_all  %>% filter(library_source == "GENOMIC") %>% filter(library_strategy == "AMPLICON") %>% nrow()
+  genomic_samples_shotgun <- experiment_list_all  %>% filter(library_source == "GENOMIC") %>% filter(library_strategy == "WGS") %>% nrow()
+  metagenomic_samples <- experiment_list_all %>% filter(library_source == "METAGENOMIC") %>% nrow()
+  metagenomic_samples_amplicon <- experiment_list_all  %>% filter(library_source == "METAGENOMIC") %>% filter(library_strategy == "AMPLICON") %>% nrow()
+  metagenomic_samples_shotgun <- experiment_list_all  %>% filter(library_source == "METAGENOMIC") %>% filter(library_strategy == "WGS") %>% nrow()
+
+  row <- c(samples,genomic_samples,genomic_samples_amplicon,genomic_samples_shotgun,metagenomic_samples,metagenomic_samples_amplicon,metagenomic_samples_shotgun)
+
+  study_statistics <- rbind(study_statistics,row)
+}
+ rownames(study_statistics) <- bioprojects
+ colnames(study_statistics) <- c("Total","Genomic","Genomic_amplicon","Genomic_shotgun","Metagenomic","Metagenomic_amplicon","Metagenomic_shotgun")
+ x
+```
