@@ -260,5 +260,6 @@ for(bioproject in bioprojects){
 }
  rownames(study_statistics) <- bioprojects
  colnames(study_statistics) <- c("Total","Genomic","Genomic_amplicon","Genomic_shotgun","Metagenomic","Metagenomic_amplicon","Metagenomic_shotgun")
- x
+ write.table(study_statistics,"output/filtered_studies_details.tsv",sep="\t",quote=FALSE,row.names=T,col.names=T)  
+
 ```
